@@ -43,9 +43,3 @@ Use the provided `download_data.sh` script to fetch the complete data automatica
 
 ---
 
-## ⚙️ Setup
-
-### 1️⃣ Clone the Repository
-```bash
-git clone https://github.com/<your-username>/AeroSound-FaultNet.git
-cd AeroSound-FaultNet
