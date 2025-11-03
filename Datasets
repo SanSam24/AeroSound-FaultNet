@@ -1,0 +1,23 @@
+This project uses two publicly available large-scale audio datasets.
+Due to GitHub’s storage limits, they are not included in this repository.
+Use the provided download_data.sh script to fetch and extract them automatically.
+
+1️⃣ AeroSonicDB (Aircraft Engine Audio)
+
+Link: Kaggle – Audio Dataset of Low-Flying Aircraft (AeroSonicDB)
+
+Description: Contains over 27 GB of real-world aircraft engine and propeller recordings from low-flying planes and helicopters.
+
+Purpose: Core dataset for building the fault recognition model — used to analyze and simulate engine anomalies.
+
+License: Free for research and non-commercial use under Kaggle’s dataset terms.
+
+2️⃣ ESC-50 (Environmental Sound Classification)
+
+Link: GitHub – ESC-50 Dataset by Karol Piczak
+
+Description: A curated collection of 2,000 environmental sound recordings across 50 classes, such as wind, rain, thunder, and machinery.
+
+Purpose: Used to simulate real-world noise conditions and test the model’s robustness under variable signal-to-noise ratios.
+
+License: Creative Commons Attribution 4.0 (CC BY 4.0) — open for research and educational use.
