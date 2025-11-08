@@ -1,12 +1,14 @@
-# Ignore dataset folders
-ESC-50-master/
-archive (8)/
-*.wav
-*.mp3
-*.flac
-
-# Ignore temporary or system files
-*.tmp
+data/
+tmp/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
 *.log
-.DS_Store
-Thumbs.db
+*.wav
+*.zip
+*.tar
+*.tar.gz
+*.h5
+*.pth
+*.pt
+*.ckpt
