@@ -1,0 +1,374 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# AeroSound-FaultNet: unified preprocessing
+# - Scans AeroSonicDB and ESC-50
+# - Filters out bad clips
+# - Standardizes to 16 kHz mono, trims silence, peak-normalizes to -3 dBFS
+# - Synthesizes "faulty" variants (tonal whine, band-limited rumble, amplitude modulation)
+# - Mixes ESC-50 noise at SNR {clean, 30, 20, 10} dB to create robustness sets
+# - Deduplicates via coarse audio fingerprinting
+# - Creates leak-proof train/val/test splits (grouping clean+noisy variants)
+# - Writes CSV manifests for training
+
+import os
+import sys
+import glob
+import math
+import random
+import hashlib
+import argparse
+import pathlib
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import librosa
+import soundfile as sf
+from sklearn.model_selection import train_test_split
+
+
+def log(msg: str):
+    print(f"[preprocess] {msg}", flush=True)
+
+
+def ensure_dir(p: str):
+    pathlib.Path(p).mkdir(parents=True, exist_ok=True)
+
+
+# ---------- Scanning & Filtering ----------
+
+def scan_audio(root: str) -> pd.DataFrame:
+    rows = []
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            ext = f.lower().rsplit(".", 1)[-1]
+            if ext not in ("wav", "flac", "mp3", "m4a", "ogg"):
+                continue
+            path = os.path.join(dp, f)
+            try:
+                y, sr = librosa.load(path, sr=None, mono=False)
+                dur = librosa.get_duration(y=y, sr=sr)
+                ch = 1 if y.ndim == 1 else y.shape[0]
+                ok = 1
+            except Exception:
+                sr, dur, ch, ok = -1, -1, -1, 0
+            rows.append(dict(path=path, sr=sr, dur=dur, ch=ch, ok=ok))
+    return pd.DataFrame(rows)
+
+
+def filter_df(df: pd.DataFrame,
+              min_dur: float = 0.5,
+              max_dur: float = 15.0,
+              min_sr: int = 8000) -> pd.DataFrame:
+    m = (df.ok == 1) & (df.dur >= min_dur) & (df.dur <= max_dur) & (df.sr >= min_sr)
+    return df[m].copy()
+
+
+# ---------- Standardization ----------
+
+def normalize_peak(y: np.ndarray, target_db: float = -3.0) -> np.ndarray:
+    peak = float(np.max(np.abs(y)) + 1e-9)
+    gain = 10 ** (target_db / 20.0) / peak
+    return y * gain
+
+
+def standardize_write(inp_path: str, out_path: str, sr_target: int = 16000) -> Tuple[int, float]:
+    y, _ = librosa.load(inp_path, sr=sr_target, mono=True)
+    yt, _ = librosa.effects.trim(y, top_db=30)
+    if len(yt) < int(0.5 * sr_target):
+        yt = y
+    yt = normalize_peak(yt, -3.0)
+    ensure_dir(str(pathlib.Path(out_path).parent))
+    sf.write(out_path, yt, sr_target)
+    return sr_target, len(yt) / sr_target
+
+
+def standardize_bulk(df_csv: str, in_root: str, out_root: str, out_csv: str, sr_target: int = 16000):
+    df = pd.read_csv(df_csv)
+    rows = []
+    for _, r in tqdm(df.iterrows(), total=len(df), desc="Standardize"):
+        inp = r["path"]
+        try:
+            rel = str(pathlib.Path(inp).relative_to(in_root))
+        except Exception:
+            rel = pathlib.Path(inp).name
+        outp = str(pathlib.Path(out_root) / rel)
+        sr, dur = standardize_write(inp, outp, sr_target)
+        rows.append(dict(path=outp, sr=sr, dur=dur))
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
+# ---------- Fault Synthesis ----------
+
+def add_tone(y, sr, f=2000, snr_db=10):
+    t = np.arange(len(y)) / sr
+    tone = np.sin(2 * np.pi * f * t)
+    Ps = np.mean(y ** 2) + 1e-12
+    Pt = np.mean(tone ** 2) + 1e-12
+    k = math.sqrt(Ps / (Pt * 10 ** (snr_db / 10)))
+    return y + k * tone
+
+
+def band_limited_noise(y, sr, f1=200, f2=600, snr_db=10):
+    n = np.random.randn(len(y))
+    S = librosa.stft(n, n_fft=1024, hop_length=256)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=1024)
+    mask = (freqs[:, None] >= f1) & (freqs[:, None] <= f2)
+    S = S * mask
+    nb = librosa.istft(S, hop_length=256, length=len(y))
+    Ps = np.mean(y ** 2) + 1e-12
+    Pn = np.mean(nb ** 2) + 1e-12
+    k = math.sqrt(Ps / (Pn * 10 ** (snr_db / 10)))
+    return y + k * nb
+
+
+def amp_mod(y, sr, rate=10, depth=0.25):
+    t = np.arange(len(y)) / sr
+    env = 1.0 + depth * np.sin(2 * np.pi * rate * t)
+    return y * env
+
+
+def synthesize_faults(aero16k_csv: str,
+                      out_healthy_dir: str,
+                      out_faulty_dir: str,
+                      out_csv: str,
+                      seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    df = pd.read_csv(aero16k_csv)
+    rows = []
+    ensure_dir(out_healthy_dir)
+    ensure_dir(out_faulty_dir)
+
+    for _, r in tqdm(df.iterrows(), total=len(df), desc="Synthesize faults"):
+        p = r["path"]
+        y, sr = librosa.load(p, sr=None, mono=True)
+
+        ph = str(pathlib.Path(out_healthy_dir) / pathlib.Path(p).name)
+        sf.write(ph, y, sr)
+        rows.append(dict(path=ph, label="healthy", sr=sr, dur=len(y) / sr))
+
+        yf = y.copy()
+        if random.random() < 0.9:
+            yf = add_tone(yf, sr, f=random.randint(1200, 2800), snr_db=random.choice([5, 10, 15]))
+        if random.random() < 0.85:
+            yf = band_limited_noise(yf, sr, f1=200, f2=600, snr_db=random.choice([5, 10, 15]))
+        if random.random() < 0.5:
+            yf = amp_mod(yf, sr, rate=random.choice([6, 12, 20]), depth=0.25)
+
+        pf = str(pathlib.Path(out_faulty_dir) / (pathlib.Path(p).stem + "_FAULT.wav"))
+        sf.write(pf, yf, sr)
+        rows.append(dict(path=pf, label="faulty", sr=sr, dur=len(yf) / sr))
+
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
+# ---------- ESC-50 Noise Pool ----------
+
+def list_esc_wavs(esc_root: str) -> List[str]:
+    paths = glob.glob(os.path.join(esc_root, "**", "audio", "*.wav"), recursive=True)
+    if not paths:
+        paths = glob.glob(os.path.join(esc_root, "**", "*.wav"), recursive=True)
+    return paths
+
+
+# ---------- Noise Mixing ----------
+
+def mix_snr(x: np.ndarray, n: np.ndarray, snr_db: float) -> np.ndarray:
+    if len(n) < len(x):
+        reps = int(np.ceil(len(x) / len(n)))
+        n = np.tile(n, reps)[:len(x)]
+    else:
+        n = n[:len(x)]
+    Px = np.mean(x ** 2) + 1e-12
+    Pn = np.mean(n ** 2) + 1e-12
+    k = math.sqrt(Px / (Pn * 10 ** (snr_db / 10.0)))
+    return x + k * n
+
+
+def make_noisy_variants(base_csv: str,
+                        esc_paths: List[str],
+                        out_dir: str,
+                        out_csv: str,
+                        snrs: List[str],
+                        seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    df = pd.read_csv(base_csv)
+    rows = []
+    ensure_dir(out_dir)
+
+    for _, r in tqdm(df.iterrows(), total=len(df), desc="Noise mixing"):
+        x, sr = librosa.load(r["path"], sr=None, mono=True)
+
+        if "clean" in snrs:
+            out_clean = str(pathlib.Path(out_dir) / (pathlib.Path(r["path"]).stem + "_SNRclean.wav"))
+            sf.write(out_clean, x, sr)
+            rows.append(dict(path=out_clean, label=r["label"], sr=sr, snr="clean"))
+
+        for s in snrs:
+            if s == "clean":
+                continue
+            snr = float(s)
+            npath = random.choice(esc_paths)
+            n, _ = librosa.load(npath, sr=sr, mono=True)
+            y = mix_snr(x, n, snr)
+            outp = str(pathlib.Path(out_dir) / (pathlib.Path(r["path"]).stem + f"_SNR{int(snr)}.wav"))
+            sf.write(outp, y, sr)
+            rows.append(dict(path=outp, label=r["label"], sr=sr, snr=int(snr)))
+
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
+# ---------- Deduplication ----------
+
+def fingerprint_audio(path: str, n_mels: int = 64) -> str:
+    y, sr = librosa.load(path, sr=None, mono=True)
+    S = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=1024, hop_length=256, n_mels=n_mels)
+    v = np.log1p(S).mean(axis=1)
+    q = np.round(100 * v / (v.max() + 1e-9)).astype(np.int16).tobytes()
+    return hashlib.md5(q).hexdigest()
+
+
+def dedupe_manifest(in_csv: str, out_csv: str) -> pd.DataFrame:
+    df = pd.read_csv(in_csv)
+    fps = []
+    for p in tqdm(df["path"], desc="Fingerprinting"):
+        try:
+            fps.append(fingerprint_audio(p))
+        except Exception:
+            fps.append("ERR")
+    df["fp"] = fps
+    keep = df[df["fp"] != "ERR"].drop_duplicates("fp", keep="first")
+    keep.to_csv(out_csv, index=False)
+    return keep
+
+
+# ---------- Splitting ----------
+
+def base_group_from_path(p: str) -> str:
+    stem = pathlib.Path(p).stem
+    stem = stem.replace("_FAULT", "")
+    stem = stem.split("_SNR")[0]
+    return stem
+
+
+def make_splits(in_csv: str,
+                out_dir: str,
+                test_size: float = 0.15,
+                val_size: float = 0.15,
+                seed: int = 42):
+    df = pd.read_csv(in_csv)
+    df["group"] = df["path"].apply(base_group_from_path)
+    groups = df[["group"]].drop_duplicates()
+
+    g_trainval, g_test = train_test_split(groups, test_size=test_size, random_state=seed, shuffle=True)
+    rel_val = val_size / (1 - test_size)
+    g_train, g_val = train_test_split(g_trainval, test_size=rel_val, random_state=seed, shuffle=True)
+
+    def subset(gs: pd.DataFrame) -> pd.DataFrame:
+        return df.merge(gs, on="group", how="inner")
+
+    train = subset(g_train)
+    val = subset(g_val)
+    test = subset(g_test)
+
+    ensure_dir(out_dir)
+    train.to_csv(os.path.join(out_dir, "train.csv"), index=False)
+    val.to_csv(os.path.join(out_dir, "val.csv"), index=False)
+    test.to_csv(os.path.join(out_dir, "test.csv"), index=False)
+    return train, val, test
+
+
+# ---------- Main ----------
+
+def main():
+    ap = argparse.ArgumentParser(description="AeroSound-FaultNet unified preprocessing")
+    ap.add_argument("--aero_root", type=str, default="data/aerosonicdb")
+    ap.add_argument("--esc_root", type=str, default="data/esc50")
+    ap.add_argument("--out_root", type=str, default="data")
+    ap.add_argument("--sr", type=int, default=16000)
+    ap.add_argument("--min_dur", type=float, default=0.5)
+    ap.add_argument("--max_dur", type=float, default=15.0)
+    ap.add_argument("--snrs", nargs="+", default=["clean", "30", "20", "10"])
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    manifests = os.path.join(args.out_root, "manifests")
+    ensure_dir(manifests)
+
+    log("Scanning AeroSonicDB...")
+    df_a = scan_audio(args.aero_root)
+    aero_scan_csv = os.path.join(manifests, "aero_raw_scan.csv")
+    df_a.to_csv(aero_scan_csv, index=False)
+
+    log("Scanning ESC-50...")
+    df_e = scan_audio(args.esc_root)
+    esc_scan_csv = os.path.join(manifests, "esc_raw_scan.csv")
+    df_e.to_csv(esc_scan_csv, index=False)
+
+    log("Filtering...")
+    df_a_k = filter_df(df_a, args.min_dur, args.max_dur)
+    df_e_k = filter_df(df_e, args.min_dur, args.max_dur)
+    aero_keep_csv = os.path.join(manifests, "aero_kept_initial.csv")
+    esc_keep_csv = os.path.join(manifests, "esc_kept_initial.csv")
+    df_a_k.to_csv(aero_keep_csv, index=False)
+    df_e_k.to_csv(esc_keep_csv, index=False)
+
+    aero16k_dir = os.path.join(args.out_root, "cleaned", "aero16k")
+    esc16k_dir = os.path.join(args.out_root, "cleaned", "esc16k")
+    ensure_dir(aero16k_dir)
+    ensure_dir(esc16k_dir)
+
+    aero16k_csv = os.path.join(manifests, "aero16k.csv")
+    esc16k_csv = os.path.join(manifests, "esc16k.csv")
+
+    log("Standardizing AeroSonicDB to 16k mono...")
+    standardize_bulk(aero_keep_csv, args.aero_root, aero16k_dir, aero16k_csv, args.sr)
+
+    log("Standardizing ESC-50 to 16k mono...")
+    standardize_bulk(esc_keep_csv, args.esc_root, esc16k_dir, esc16k_csv, args.sr)
+
+    log("Synthesizing faults...")
+    aero_healthy_dir = os.path.join(args.out_root, "cleaned", "aero16k_healthy")
+    aero_faulty_dir = os.path.join(args.out_root, "cleaned", "aero16k_faulty")
+    ensure_dir(aero_healthy_dir)
+    ensure_dir(aero_faulty_dir)
+    aero_with_faults_csv = os.path.join(manifests, "aero16k_with_faults.csv")
+    synthesize_faults(aero16k_csv, aero_healthy_dir, aero_faulty_dir, aero_with_faults_csv, args.seed)
+
+    log("Indexing ESC-50 noise pool...")
+    esc_pool = list_esc_wavs(esc16k_dir if os.listdir(esc16k_dir) else args.esc_root)
+    if not esc_pool:
+        log("WARNING: No ESC-50 wavs found under esc_root. Check your download/extraction paths.")
+
+    log(f"Making noisy variants (SNRs={args.snrs})...")
+    aero_noisy_dir = os.path.join(args.out_root, "cleaned", "aero16k_noisy")
+    ensure_dir(aero_noisy_dir)
+    aero_noisy_csv = os.path.join(manifests, "aero16k_noisy_manifest.csv")
+    make_noisy_variants(aero_with_faults_csv, esc_pool, aero_noisy_dir, aero_noisy_csv, args.snrs, args.seed)
+
+    log("Deduplicating...")
+    aero_unique_csv = os.path.join(manifests, "aero16k_noisy_unique.csv")
+    keep_df = dedupe_manifest(aero_noisy_csv, aero_unique_csv)
+
+    log("Creating train/val/test splits...")
+    train, val, test = make_splits(aero_unique_csv, manifests, test_size=0.15, val_size=0.15, seed=args.seed)
+
+    log("Done.")
+    log(f"Train: {len(train)} | Val: {len(val)} | Test: {len(test)}")
+    log(f"Manifests written to: {manifests}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("Interrupted by user.")
+        sys.exit(1)
