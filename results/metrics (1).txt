@@ -1,0 +1,2 @@
+Overall Test Accuracy: 0.9500713348388672
+SNR clean: 0.9736147522926331
